@@ -20,6 +20,8 @@ export interface AppConfig {
   readonly codexWorkspaceCwd: string;
   readonly codexBin: string;
   readonly codexModel?: string;
+  readonly codexModelCandidates: readonly string[];
+  readonly codexModelProbeTimeoutMs: number;
   readonly databasePath: string;
   readonly serviceName: string;
   readonly pollTimeoutSeconds: number;
@@ -77,7 +79,13 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): App
     process.cwd();
   const codexWorkspaceCwd = path.resolve(instanceRoot, codexWorkspaceValue);
   const codexBin = readOptionalEnv(mergedEnv, "CODEX_BIN") || "codex";
-  const codexModel = readOptionalEnv(mergedEnv, "CODEX_MODEL") || undefined;
+  const codexModelValue = readOptionalEnv(mergedEnv, "CODEX_MODEL");
+  const codexModel = codexModelValue && codexModelValue.toLowerCase() !== "auto" ? codexModelValue : undefined;
+  const codexModelCandidates = parseModelCandidates(
+    codexModelValue,
+    readOptionalEnv(mergedEnv, "CODEX_MODEL_CANDIDATES"),
+    readOptionalEnv(mergedEnv, "CODEX_MODEL_FALLBACKS"),
+  );
   const openaiApiKey = readOptionalEnv(mergedEnv, "OPENAI_API_KEY") || undefined;
 
   ensureDirectory(instanceRoot);
@@ -107,6 +115,8 @@ export function loadConfig(argv = process.argv.slice(2), env = process.env): App
     codexWorkspaceCwd,
     codexBin,
     codexModel,
+    codexModelCandidates,
+    codexModelProbeTimeoutMs: parsePositiveInteger(mergedEnv, "CODEX_MODEL_PROBE_TIMEOUT_MS", 120_000),
     databasePath,
     serviceName,
     pollTimeoutSeconds: parsePositiveInteger(mergedEnv, "TG_POLL_TIMEOUT_SECONDS", 30),
@@ -236,6 +246,41 @@ function parsePositiveInteger(env: EnvSource, name: string, fallback: number): n
     throw new Error(`${name} must be a positive integer`);
   }
   return parsed;
+}
+
+function parseModelCandidates(
+  modelValue: string | undefined,
+  candidatesValue: string | undefined,
+  fallbacksValue: string | undefined,
+): string[] {
+  const explicitCandidates = parseCommaSeparatedList(candidatesValue);
+  if (explicitCandidates.length > 0) {
+    return explicitCandidates;
+  }
+
+  const fallbacks = parseCommaSeparatedList(fallbacksValue);
+  if (!modelValue || modelValue.toLowerCase() === "auto") {
+    return fallbacks;
+  }
+
+  return uniqueStrings([modelValue, ...fallbacks]);
+}
+
+function parseCommaSeparatedList(value: string | undefined): string[] {
+  if (!value) {
+    return [];
+  }
+
+  return uniqueStrings(
+    value
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry && entry.toLowerCase() !== "auto"),
+  );
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values)];
 }
 
 function deriveInstanceName(configFilePath: string): string {

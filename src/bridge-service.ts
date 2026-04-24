@@ -14,6 +14,7 @@ import type { ThreadItem } from "./generated/v2/ThreadItem";
 import type { ToolRequestUserInputParams } from "./generated/v2/ToolRequestUserInputParams";
 import type { UserInput } from "./generated/v2/UserInput";
 import { CodexAppServerClient } from "./codex-app-server";
+import { getErrorMessage, isModelAccessError, selectCodexModel } from "./codex-model";
 import type { AppConfig } from "./config";
 import type { PendingRequestRow, ThreadSelectedSkill } from "./db";
 import { BridgeDatabase } from "./db";
@@ -34,6 +35,9 @@ import {
 
 interface ChatRuntimeState {
   activeTurnId: string | null;
+  activeTurnInput: UserInput[] | null;
+  activeTurnModel: string | null;
+  activeTurnRetryCount: number;
   currentThreadId: string | null;
   currentThreadName: string | null;
   pendingTurnStart: boolean;
@@ -260,6 +264,9 @@ export class BridgeService {
   private stopRequested = false;
   private botUsername: string | null = null;
   private lastTelegramFileCleanupAt = 0;
+  private activeCodexModel: string | null = null;
+  private codexModelCandidates: readonly string[] = [];
+  private readonly unavailableCodexModels = new Set<string>();
 
   public constructor(
     private readonly config: AppConfig,
@@ -273,6 +280,9 @@ export class BridgeService {
       this.chatIdByThreadId.set(session.threadId, session.chatId);
       this.runtimeByChatId.set(session.chatId, {
         activeTurnId: null,
+        activeTurnInput: null,
+        activeTurnModel: null,
+        activeTurnRetryCount: 0,
         currentThreadId: session.threadId,
         currentThreadName: null,
         pendingTurnStart: false,
@@ -296,9 +306,7 @@ export class BridgeService {
   public async start(): Promise<void> {
     await this.codex.start();
     await this.codex.ensureAuthenticated();
-    if (this.config.codexModel) {
-      console.log(`Codex model override: ${this.config.codexModel}`);
-    }
+    await this.resolveActiveCodexModel();
     await this.reconcileDesktopSessionIndex();
 
     const bot = await this.telegram.getMe();
@@ -309,6 +317,7 @@ export class BridgeService {
       { command: "current", description: "查看当前会话" },
       { command: "sessions", description: "选择已有会话" },
       { command: "skills", description: "选择当前会话技能" },
+      { command: "model", description: "查看或切换 Codex 模型" },
     ]);
 
     console.log(`Connected Telegram bot @${bot.username || bot.first_name}`);
@@ -449,9 +458,7 @@ export class BridgeService {
         });
       } catch (error) {
         console.error(`Failed to steer active turn ${runtime.activeTurnId} for thread ${threadId}:`, error);
-        runtime.activeTurnId = null;
-        runtime.pendingTurnStart = false;
-        runtime.tracker = null;
+        this.clearActiveTurn(runtime);
         await this.sendTelegramFailureNotice(
           message.chat.id,
           "追加到当前回合失败了，请再发一次消息重试。",
@@ -472,28 +479,20 @@ export class BridgeService {
     );
     runtime.tracker = tracker;
     runtime.pendingTurnStart = true;
+    runtime.activeTurnInput = turnInput;
+    runtime.activeTurnModel = this.activeCodexModel;
+    runtime.activeTurnRetryCount = 0;
     tracker.setStatusLine("正在把消息交给 Codex...");
     await tracker.flushNow();
 
     try {
-      const response = await this.codex.startTurn({
-        threadId,
-        input: turnInput,
-        model: this.config.codexModel,
-      });
-
-      if (runtime.activeTurnId && runtime.activeTurnId !== response.turn.id) {
-        console.warn(
-          `Turn tracker attached to ${runtime.activeTurnId} before startTurn returned ${response.turn.id} for thread ${threadId}`,
-        );
-      }
-      runtime.activeTurnId = response.turn.id;
-      runtime.pendingTurnStart = false;
+      await this.startRuntimeTurn(runtime, threadId, turnInput, tracker, 0);
     } catch (error) {
       console.error(`Failed to start turn for thread ${threadId}:`, error);
-      runtime.activeTurnId = null;
-      runtime.pendingTurnStart = false;
-      runtime.tracker = null;
+      if (await this.retryTurnWithFallback(runtime, threadId, tracker, getErrorMessage(error))) {
+        return;
+      }
+      this.clearActiveTurn(runtime);
       await tracker.finish("failed", "启动这一轮对话失败了，请稍后重试。");
     }
   }
@@ -569,6 +568,21 @@ export class BridgeService {
       return;
     }
 
+    if (data.startsWith("mp:")) {
+      await this.handleModelPickerRefresh(callbackQuery);
+      return;
+    }
+
+    if (data.startsWith("ma:")) {
+      await this.handleModelAutoSelect(callbackQuery);
+      return;
+    }
+
+    if (data.startsWith("ms:")) {
+      await this.handleModelSelect(callbackQuery, data.slice(3));
+      return;
+    }
+
     await this.telegram.answerCallbackQuery(callbackQuery.id, "Unsupported action");
   }
 
@@ -589,6 +603,9 @@ export class BridgeService {
       case "skills":
         await this.handleSkillsCommand(message);
         return;
+      case "model":
+        await this.handleModelCommand(message);
+        return;
       default:
         return;
     }
@@ -600,7 +617,7 @@ export class BridgeService {
       const skillsSummary = this.renderSelectedSkillsSummary(current.id);
       await this.telegram.sendMessage(
         message.chat.id,
-        `Codex 已连接。\n\n当前会话：${current.name}\n线程：${current.id}\n${skillsSummary}\n\n发送 /sessions 可以切换已有会话，发送 /skills 可以选择技能，发送 /new 可以新建一个。`,
+        `Codex 已连接。\n\n当前会话：${current.name}\n线程：${current.id}\n${this.renderModelSummary()}\n${skillsSummary}\n\n发送 /sessions 可以切换已有会话，发送 /skills 可以选择技能，发送 /new 可以新建一个。`,
         { replyToMessageId: message.message_id },
       );
       return;
@@ -611,7 +628,7 @@ export class BridgeService {
       const name = (await this.getCurrentThreadSummary(message.chat.id))?.name || threadId;
       await this.telegram.sendMessage(
         message.chat.id,
-        `Codex 已连接。\n\n已新建会话：${name}\n线程：${threadId}\n当前技能：未选择\n\n直接发消息即可，发送 /sessions 可以切换已有会话，发送 /skills 可以选择技能。`,
+        `Codex 已连接。\n\n已新建会话：${name}\n线程：${threadId}\n${this.renderModelSummary()}\n当前技能：未选择\n\n直接发消息即可，发送 /sessions 可以切换已有会话，发送 /skills 可以选择技能。`,
         { replyToMessageId: message.message_id },
       );
       return;
@@ -629,7 +646,7 @@ export class BridgeService {
     const current = await this.getCurrentThreadSummary(message.chat.id);
     await this.telegram.sendMessage(
       message.chat.id,
-      `已新建一个 Codex 对话。\n\n当前会话：${current?.name || threadId}\n线程：${threadId}\n当前技能：未选择`,
+      `已新建一个 Codex 对话。\n\n当前会话：${current?.name || threadId}\n线程：${threadId}\n${this.renderModelSummary()}\n当前技能：未选择`,
       { replyToMessageId: message.message_id },
     );
   }
@@ -649,7 +666,7 @@ export class BridgeService {
 
     await this.telegram.sendMessage(
       message.chat.id,
-      `当前会话：${current.name}\n线程：${current.id}\n${this.renderSelectedSkillsSummary(current.id)}`,
+      `当前会话：${current.name}\n线程：${current.id}\n${this.renderModelSummary()}\n${this.renderSelectedSkillsSummary(current.id)}`,
       { replyToMessageId: message.message_id },
     );
   }
@@ -661,6 +678,14 @@ export class BridgeService {
     }
 
     await this.showThreadSkills(message.chat.id, message.message_id, threadId, 0);
+  }
+
+  private async handleModelCommand(message: TelegramMessage): Promise<void> {
+    const view = this.buildModelPickerView(message.chat.id);
+    await this.telegram.sendMessage(message.chat.id, view.text, {
+      replyToMessageId: message.message_id,
+      replyMarkup: view.replyMarkup,
+    });
   }
 
   private async handleApprovalDecision(
@@ -938,14 +963,25 @@ export class BridgeService {
     const runtime = this.getOrCreateRuntime(chatId);
     const tracker = this.findTracker(threadId, turnId);
     try {
+      if (
+        status === "failed" &&
+        isModelAccessError(errorMessage) &&
+        tracker &&
+        runtime.activeTurnInput &&
+        runtime.activeTurnRetryCount < 1
+      ) {
+        const retried = await this.retryTurnWithFallback(runtime, threadId, tracker, errorMessage || "");
+        if (retried) {
+          return;
+        }
+      }
+
       if (tracker) {
         await tracker.finish(status, errorMessage);
       }
     } finally {
       if (runtime.currentThreadId === threadId && runtime.activeTurnId === turnId) {
-        runtime.activeTurnId = null;
-        runtime.pendingTurnStart = false;
-        runtime.tracker = null;
+        this.clearActiveTurn(runtime);
       }
     }
   }
@@ -1046,11 +1082,103 @@ export class BridgeService {
     });
   }
 
+  private async resolveActiveCodexModel(): Promise<void> {
+    const selection = await selectCodexModel(this.codex, this.config, this.unavailableCodexModels);
+    this.activeCodexModel = selection.model;
+    this.codexModelCandidates = selection.candidates;
+
+    console.log(`Codex models OK: ${selection.visibleModelCount} model(s) visible`);
+    if (selection.failures.length > 0) {
+      for (const failure of selection.failures) {
+        console.warn(`Codex model probe failed for ${failure.model}: ${failure.error}`);
+      }
+    }
+    console.log(`Codex active model: ${selection.model}`);
+  }
+
+  private async startRuntimeTurn(
+    runtime: ChatRuntimeState,
+    threadId: string,
+    input: UserInput[],
+    tracker: TurnTracker,
+    retryCount: number,
+  ): Promise<void> {
+    const model = this.requireActiveCodexModel();
+    const response = await this.codex.startTurn({
+      threadId,
+      input,
+      model,
+    });
+
+    if (runtime.activeTurnId && runtime.activeTurnId !== response.turn.id) {
+      console.warn(
+        `Turn tracker attached to ${runtime.activeTurnId} before startTurn returned ${response.turn.id} for thread ${threadId}`,
+      );
+    }
+
+    runtime.activeTurnId = response.turn.id;
+    runtime.activeTurnInput = input;
+    runtime.activeTurnModel = model;
+    runtime.activeTurnRetryCount = retryCount;
+    runtime.pendingTurnStart = false;
+    runtime.tracker = tracker;
+  }
+
+  private async retryTurnWithFallback(
+    runtime: ChatRuntimeState,
+    threadId: string,
+    tracker: TurnTracker,
+    reason: string,
+  ): Promise<boolean> {
+    if (!isModelAccessError(reason) || !runtime.activeTurnInput || runtime.activeTurnRetryCount >= 1) {
+      return false;
+    }
+
+    const failedModel = runtime.activeTurnModel || this.activeCodexModel;
+    if (failedModel) {
+      this.unavailableCodexModels.add(failedModel);
+    }
+
+    try {
+      await this.resolveActiveCodexModel();
+    } catch (error) {
+      console.error("Failed to select fallback Codex model:", error);
+      return false;
+    }
+
+    const nextModel = this.requireActiveCodexModel();
+    if (failedModel && nextModel === failedModel) {
+      return false;
+    }
+
+    tracker.setStatusLine(`模型 ${failedModel || "unknown"} 不可用，已切换到 ${nextModel}，正在重试本轮...`);
+    runtime.pendingTurnStart = true;
+
+    try {
+      await this.startRuntimeTurn(runtime, threadId, runtime.activeTurnInput, tracker, runtime.activeTurnRetryCount + 1);
+      return true;
+    } catch (error) {
+      console.error(`Failed to retry turn with fallback model ${nextModel}:`, error);
+      if (isModelAccessError(getErrorMessage(error))) {
+        this.unavailableCodexModels.add(nextModel);
+      }
+      return false;
+    }
+  }
+
+  private requireActiveCodexModel(): string {
+    if (!this.activeCodexModel) {
+      throw new Error("Codex model has not been selected yet");
+    }
+
+    return this.activeCodexModel;
+  }
+
   private async createNewThread(chatId: number, interruptCurrent: boolean): Promise<string> {
     const response = await this.codex.startThread({
       cwd: this.config.codexWorkspaceCwd,
       serviceName: this.config.serviceName,
-      model: this.config.codexModel,
+      model: this.requireActiveCodexModel(),
     });
 
     const defaultName = buildDefaultThreadName();
@@ -1072,7 +1200,7 @@ export class BridgeService {
 
     await this.codex.resumeThread({
       threadId,
-      model: this.config.codexModel,
+      model: this.requireActiveCodexModel(),
     });
     this.loadedThreadIds.add(threadId);
   }
@@ -1083,8 +1211,8 @@ export class BridgeService {
     }
 
     if (/model .*does not exist or you do not have access/i.test(errorMessage)) {
-      const configuredModel = this.config.codexModel || "本机 Codex 默认模型";
-      return `${errorMessage}\n\n桥接当前使用的模型不可用：${configuredModel}。请在桥接配置里把 CODEX_MODEL 设成当前账号可用的模型，例如 gpt-5.4。`;
+      const configuredModel = this.activeCodexModel || this.config.codexModel || "自动选择模型";
+      return `${errorMessage}\n\n桥接当前使用的模型不可用：${configuredModel}。请在桥接配置里调整 CODEX_MODEL_CANDIDATES 或 CODEX_MODEL_FALLBACKS。`;
     }
 
     return errorMessage;
@@ -1096,6 +1224,9 @@ export class BridgeService {
       const persisted = this.db.getChatSession(chatId);
       runtime = {
         activeTurnId: null,
+        activeTurnInput: null,
+        activeTurnModel: null,
+        activeTurnRetryCount: 0,
         currentThreadId: persisted?.threadId || null,
         currentThreadName: null,
         pendingTurnStart: false,
@@ -1160,9 +1291,7 @@ export class BridgeService {
       if (previousRuntime?.currentThreadId === threadId) {
         previousRuntime.currentThreadId = null;
         previousRuntime.currentThreadName = null;
-        previousRuntime.activeTurnId = null;
-        previousRuntime.pendingTurnStart = false;
-        previousRuntime.tracker = null;
+        this.clearActiveTurn(previousRuntime);
       }
     }
 
@@ -1171,9 +1300,7 @@ export class BridgeService {
       await this.interruptRuntimeTurn(runtime, "switch session");
       interruptedCurrent = true;
     } else {
-      runtime.activeTurnId = null;
-      runtime.pendingTurnStart = false;
-      runtime.tracker = null;
+      this.clearActiveTurn(runtime);
     }
 
     runtime.currentThreadId = threadId;
@@ -1189,9 +1316,7 @@ export class BridgeService {
 
   private async interruptRuntimeTurn(runtime: ChatRuntimeState, reason: string): Promise<void> {
     if (!runtime.activeTurnId || !runtime.currentThreadId) {
-      runtime.activeTurnId = null;
-      runtime.pendingTurnStart = false;
-      runtime.tracker = null;
+      this.clearActiveTurn(runtime);
       return;
     }
 
@@ -1204,7 +1329,14 @@ export class BridgeService {
     if (runtime.tracker) {
       await runtime.tracker.finish("interrupted");
     }
+    this.clearActiveTurn(runtime);
+  }
+
+  private clearActiveTurn(runtime: ChatRuntimeState): void {
     runtime.activeTurnId = null;
+    runtime.activeTurnInput = null;
+    runtime.activeTurnModel = null;
+    runtime.activeTurnRetryCount = 0;
     runtime.pendingTurnStart = false;
     runtime.tracker = null;
   }
@@ -1511,6 +1643,73 @@ export class BridgeService {
     );
   }
 
+  private async handleModelPickerRefresh(callbackQuery: TelegramCallbackQuery): Promise<void> {
+    const message = callbackQuery.message;
+    if (!message) {
+      await this.telegram.answerCallbackQuery(callbackQuery.id, "无效请求");
+      return;
+    }
+
+    await this.refreshModelPickerMessage(message.chat.id, message.message_id);
+    await this.telegram.answerCallbackQuery(callbackQuery.id, "已刷新");
+  }
+
+  private async handleModelAutoSelect(callbackQuery: TelegramCallbackQuery): Promise<void> {
+    const message = callbackQuery.message;
+    if (!message) {
+      await this.telegram.answerCallbackQuery(callbackQuery.id, "无效请求");
+      return;
+    }
+
+    await this.telegram.answerCallbackQuery(callbackQuery.id, "正在探活候选模型...");
+    await this.telegram.editMessageText(message.chat.id, message.message_id, `${this.renderModelSummary()}\n\n正在按候选链重新探活...`);
+
+    try {
+      this.unavailableCodexModels.clear();
+      await this.resolveActiveCodexModel();
+      await this.refreshModelPickerMessage(message.chat.id, message.message_id);
+    } catch (error) {
+      await this.telegram.editMessageText(
+        message.chat.id,
+        message.message_id,
+        `${this.renderModelSummary()}\n\n自动探活失败：${getErrorMessage(error)}`,
+        { replyMarkup: this.buildModelPickerView(message.chat.id).replyMarkup },
+      );
+    }
+  }
+
+  private async handleModelSelect(callbackQuery: TelegramCallbackQuery, rawModel: string): Promise<void> {
+    const message = callbackQuery.message;
+    const model = decodeURIComponent(rawModel).trim();
+    if (!message || !model || !this.codexModelCandidates.includes(model)) {
+      await this.telegram.answerCallbackQuery(callbackQuery.id, "无效模型");
+      return;
+    }
+
+    await this.telegram.answerCallbackQuery(callbackQuery.id, `正在探活 ${model}...`);
+    await this.telegram.editMessageText(message.chat.id, message.message_id, `${this.renderModelSummary()}\n\n正在探活：${model}`);
+
+    try {
+      await this.codex.probeModel({
+        model,
+        cwd: this.config.codexWorkspaceCwd,
+        serviceName: `${this.config.serviceName}_model_manual_probe`,
+        timeoutMs: this.config.codexModelProbeTimeoutMs,
+      });
+      this.unavailableCodexModels.delete(model);
+      this.activeCodexModel = model;
+      await this.refreshModelPickerMessage(message.chat.id, message.message_id);
+    } catch (error) {
+      this.unavailableCodexModels.add(model);
+      await this.telegram.editMessageText(
+        message.chat.id,
+        message.message_id,
+        `${this.renderModelSummary()}\n\n模型 ${model} 探活失败：${getErrorMessage(error)}`,
+        { replyMarkup: this.buildModelPickerView(message.chat.id).replyMarkup },
+      );
+    }
+  }
+
   private async ensureThreadForSkills(message: TelegramMessage): Promise<string | null> {
     const runtime = this.getOrCreateRuntime(message.chat.id);
     if (runtime.currentThreadId) {
@@ -1803,8 +2002,55 @@ export class BridgeService {
     });
   }
 
+  private async refreshModelPickerMessage(chatId: number, messageId: number): Promise<void> {
+    const view = this.buildModelPickerView(chatId);
+    await this.telegram.editMessageText(chatId, messageId, view.text, {
+      replyMarkup: view.replyMarkup,
+    });
+  }
+
+  private buildModelPickerView(chatId: number): { readonly text: string; readonly replyMarkup: TelegramReplyMarkup } {
+    const runtime = this.getOrCreateRuntime(chatId);
+    const lines = [this.renderModelSummary()];
+
+    if (runtime.activeTurnId || runtime.pendingTurnStart) {
+      lines.push("", "提示：当前回合进行中，切换模型会从下一轮开始生效。");
+    }
+
+    if (this.unavailableCodexModels.size > 0) {
+      lines.push("", `本进程已标记不可用：${[...this.unavailableCodexModels].join(", ")}`);
+    }
+
+    lines.push("", "选择模型：");
+    const rows: TelegramInlineKeyboardButton[][] = this.codexModelCandidates.map((model) => {
+      const isActive = model === this.activeCodexModel;
+      const unavailable = this.unavailableCodexModels.has(model);
+      const prefix = isActive ? "[当前] " : unavailable ? "[不可用] " : "";
+      return [
+        {
+          text: truncateButtonLabel(`${prefix}${model}`, 32),
+          callback_data: `ms:${encodeURIComponent(model)}`,
+        },
+      ];
+    });
+
+    rows.push([{ text: "自动探活选择", callback_data: "ma:auto" }]);
+    rows.push([{ text: "刷新", callback_data: "mp:refresh" }]);
+
+    return {
+      text: lines.join("\n"),
+      replyMarkup: { inline_keyboard: rows },
+    };
+  }
+
   private renderSelectedSkillsSummary(threadId: string): string {
     return renderSelectedSkillsSummaryFromRows(this.db.listSelectedSkills(threadId), "当前技能");
+  }
+
+  private renderModelSummary(): string {
+    const active = this.activeCodexModel || "尚未完成探活";
+    const candidates = this.codexModelCandidates.length > 0 ? `\n候选模型：${this.codexModelCandidates.join(" -> ")}` : "";
+    return `当前模型：${active}${candidates}`;
   }
 
   private async ensureThreadNamedForDesktop(
@@ -2313,7 +2559,14 @@ function isSupportedChatType(chatType: string): boolean {
 }
 
 function isSupportedCommand(command: string): boolean {
-  return command === "start" || command === "new" || command === "current" || command === "sessions" || command === "skills";
+  return (
+    command === "start" ||
+    command === "new" ||
+    command === "current" ||
+    command === "sessions" ||
+    command === "skills" ||
+    command === "model"
+  );
 }
 
 function isPathWithinWorkspace(candidatePath: string, workspaceRoot: string): boolean {

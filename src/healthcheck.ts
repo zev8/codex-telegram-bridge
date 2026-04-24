@@ -1,4 +1,5 @@
 import { CodexAppServerClient } from "./codex-app-server";
+import { selectCodexModel } from "./codex-model";
 import { loadConfig } from "./config";
 import { TelegramClient } from "./telegram";
 
@@ -28,14 +29,12 @@ async function main(): Promise<void> {
     throw new Error("Codex auth is missing");
   }
 
-  const models = await codex.listModels();
-  console.log(`Codex models OK: ${models.data.length} model(s) visible`);
-  if (config.codexModel) {
-    if (!models.data.some((model) => model.model === config.codexModel)) {
-      throw new Error(`Configured CODEX_MODEL is not visible to Codex: ${config.codexModel}`);
-    }
-    console.log(`Codex model override OK: ${config.codexModel}`);
+  const selection = await selectCodexModel(codex, config);
+  console.log(`Codex models OK: ${selection.visibleModelCount} model(s) visible`);
+  for (const failure of selection.failures) {
+    console.warn(`Codex model probe failed for ${failure.model}: ${failure.error}`);
   }
+  console.log(`Codex model probe OK: ${selection.model}`);
 
   await codex.close();
 }

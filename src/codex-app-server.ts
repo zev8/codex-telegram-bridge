@@ -53,6 +53,13 @@ export interface CodexAppServerOptions {
   readonly openaiApiKey?: string;
 }
 
+export interface ModelProbeOptions {
+  readonly model: string;
+  readonly cwd: string;
+  readonly serviceName: string;
+  readonly timeoutMs: number;
+}
+
 export class CodexAppServerClient extends EventEmitter {
   private process: ChildProcessWithoutNullStreams | null = null;
   private reader: Interface | null = null;
@@ -192,6 +199,39 @@ export class CodexAppServerClient extends EventEmitter {
       threadId,
       name,
     });
+  }
+
+  public async probeModel(options: ModelProbeOptions): Promise<void> {
+    const thread = await this.startThread({
+      cwd: options.cwd,
+      serviceName: options.serviceName,
+      model: options.model,
+      ephemeral: true,
+    });
+    const threadId = thread.thread.id;
+    let turnId: string | null = null;
+    const completed = this.waitForNotification(
+      "turn/completed",
+      (notification) => notification.params.threadId === threadId && (!turnId || notification.params.turn.id === turnId),
+      options.timeoutMs,
+    );
+
+    try {
+      const turn = await this.startTurn({
+        threadId,
+        model: options.model,
+        input: [{ type: "text", text: "Reply exactly: OK", text_elements: [] }],
+      });
+      turnId = turn.turn.id;
+    } catch (error) {
+      completed.catch(() => undefined);
+      throw error;
+    }
+
+    const notification = await completed;
+    if (notification.params.turn.status !== "completed") {
+      throw new Error(notification.params.turn.error?.message || `Probe turn failed with status ${notification.params.turn.status}`);
+    }
   }
 
   public async respond(id: RequestId, result: unknown): Promise<void> {
