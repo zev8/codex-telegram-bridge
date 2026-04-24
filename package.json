@@ -1,0 +1,30 @@
+{
+  "name": "codex-telegram-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telegram bridge for talking to a local Codex instance through the Codex app-server.",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc --noEmit -p tsconfig.json",
+    "doctor:codex": "tsx src/healthcheck-codex.ts",
+    "doctor:telegram": "tsx src/healthcheck-telegram.ts",
+    "dev": "tsx src/index.ts",
+    "doctor": "tsx src/healthcheck.ts",
+    "generate:protocol": "codex app-server generate-ts --out src/generated",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.6.1",
+    "undici": "^7.16.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.6.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=24.0.0"
+  }
+}
