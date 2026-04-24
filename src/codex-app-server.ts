@@ -121,11 +121,19 @@ export class CodexAppServerClient extends EventEmitter {
   }
 
   public async close(): Promise<void> {
-    if (!this.process) {
+    const child = this.process;
+    if (!child) {
       return;
     }
 
-    this.process.kill("SIGTERM");
+    await new Promise<void>((resolve) => {
+      const timeout = setTimeout(resolve, 2_000);
+      child.once("exit", () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+      child.kill("SIGTERM");
+    });
   }
 
   public async ensureAuthenticated(): Promise<GetAccountResponse> {

@@ -326,6 +326,13 @@ npm run build
 - 先在 Codex 桌面端或 CLI 完成登录。
 - 或在实例配置中添加 `OPENAI_API_KEY`。
 
+### `Your access token could not be refreshed`
+
+通常是运行中的桥接服务还持有旧账号认证状态，而你已经切换了 Codex 登录账号。桥接会检测这个错误，自动重启本地 `codex app-server`，重新读取当前账号，并重试失败回合一次。
+
+- 如果自动重试仍失败，先在 Codex 桌面端或 CLI 重新登录。
+- 然后重新发送 Telegram 消息，或重启桥接服务。
+
 ### `The model ... does not exist or you do not have access to it`
 
 当前账号不可用所配置的 Codex 模型。

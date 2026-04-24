@@ -14,9 +14,15 @@ export interface CodexModelSelection {
 }
 
 const MODEL_ACCESS_ERROR_PATTERN = /(?:the model .*does not exist|do not have access to it|model .*not found|unsupported model)/i;
+const AUTH_REFRESH_ERROR_PATTERN =
+  /(?:access token could not be refreshed|logged out or signed in to another account|codex is not authenticated|auth.*missing|sign in again)/i;
 
 export function isModelAccessError(message: string | null | undefined): boolean {
   return Boolean(message && MODEL_ACCESS_ERROR_PATTERN.test(message));
+}
+
+export function isAuthRefreshError(message: string | null | undefined): boolean {
+  return Boolean(message && AUTH_REFRESH_ERROR_PATTERN.test(message));
 }
 
 export async function selectCodexModel(

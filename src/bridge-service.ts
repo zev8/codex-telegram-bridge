@@ -14,7 +14,7 @@ import type { ThreadItem } from "./generated/v2/ThreadItem";
 import type { ToolRequestUserInputParams } from "./generated/v2/ToolRequestUserInputParams";
 import type { UserInput } from "./generated/v2/UserInput";
 import { CodexAppServerClient } from "./codex-app-server";
-import { getErrorMessage, isModelAccessError, selectCodexModel } from "./codex-model";
+import { getErrorMessage, isAuthRefreshError, isModelAccessError, selectCodexModel } from "./codex-model";
 import type { AppConfig } from "./config";
 import type { PendingRequestRow, ThreadSelectedSkill } from "./db";
 import { BridgeDatabase } from "./db";
@@ -267,6 +267,7 @@ export class BridgeService {
   private activeCodexModel: string | null = null;
   private codexModelCandidates: readonly string[] = [];
   private readonly unavailableCodexModels = new Set<string>();
+  private codexRestartPromise: Promise<void> | null = null;
 
   public constructor(
     private readonly config: AppConfig,
@@ -489,6 +490,9 @@ export class BridgeService {
       await this.startRuntimeTurn(runtime, threadId, turnInput, tracker, 0);
     } catch (error) {
       console.error(`Failed to start turn for thread ${threadId}:`, error);
+      if (await this.retryTurnAfterAuthRefresh(runtime, threadId, tracker, getErrorMessage(error))) {
+        return;
+      }
       if (await this.retryTurnWithFallback(runtime, threadId, tracker, getErrorMessage(error))) {
         return;
       }
@@ -833,7 +837,7 @@ export class BridgeService {
       }
       case "error": {
         const tracker = this.findTracker(notification.params.threadId, notification.params.turnId);
-        tracker?.setErrorLine(notification.params.error.message);
+        tracker?.setErrorLine(this.renderTurnErrorMessage(notification.params.error.message) || notification.params.error.message);
         return;
       }
       case "turn/completed":
@@ -963,6 +967,19 @@ export class BridgeService {
     const runtime = this.getOrCreateRuntime(chatId);
     const tracker = this.findTracker(threadId, turnId);
     try {
+      if (
+        status === "failed" &&
+        isAuthRefreshError(errorMessage) &&
+        tracker &&
+        runtime.activeTurnInput &&
+        runtime.activeTurnRetryCount < 1
+      ) {
+        const retried = await this.retryTurnAfterAuthRefresh(runtime, threadId, tracker, errorMessage || "");
+        if (retried) {
+          return;
+        }
+      }
+
       if (
         status === "failed" &&
         isModelAccessError(errorMessage) &&
@@ -1166,6 +1183,56 @@ export class BridgeService {
     }
   }
 
+  private async retryTurnAfterAuthRefresh(
+    runtime: ChatRuntimeState,
+    threadId: string,
+    tracker: TurnTracker,
+    reason: string,
+  ): Promise<boolean> {
+    if (!isAuthRefreshError(reason) || !runtime.activeTurnInput || runtime.activeTurnRetryCount >= 1) {
+      return false;
+    }
+
+    tracker.setStatusLine("Codex 登录账号已变化，正在重启本地 app-server 并重试本轮...");
+    runtime.pendingTurnStart = true;
+    runtime.activeTurnId = null;
+
+    try {
+      await this.restartCodexAppServer();
+      await this.ensureThreadLoaded(threadId);
+      await this.startRuntimeTurn(runtime, threadId, runtime.activeTurnInput, tracker, runtime.activeTurnRetryCount + 1);
+      return true;
+    } catch (error) {
+      console.error("Failed to recover Codex auth and retry turn:", error);
+      tracker.setErrorLine(this.renderTurnErrorMessage(getErrorMessage(error)) || getErrorMessage(error));
+      return false;
+    }
+  }
+
+  private async restartCodexAppServer(): Promise<void> {
+    if (this.codexRestartPromise) {
+      await this.codexRestartPromise;
+      return;
+    }
+
+    this.codexRestartPromise = (async () => {
+      console.warn("Restarting Codex app-server after authentication state changed");
+      await this.codex.close();
+      this.loadedThreadIds.clear();
+      this.activeCodexModel = null;
+      this.unavailableCodexModels.clear();
+      await this.codex.start();
+      await this.codex.ensureAuthenticated();
+      await this.resolveActiveCodexModel();
+    })();
+
+    try {
+      await this.codexRestartPromise;
+    } finally {
+      this.codexRestartPromise = null;
+    }
+  }
+
   private requireActiveCodexModel(): string {
     if (!this.activeCodexModel) {
       throw new Error("Codex model has not been selected yet");
@@ -1208,6 +1275,10 @@ export class BridgeService {
   private renderTurnErrorMessage(errorMessage: string | null): string | null {
     if (!errorMessage) {
       return null;
+    }
+
+    if (isAuthRefreshError(errorMessage)) {
+      return `${errorMessage}\n\n桥接检测到 Codex 登录账号发生变化。如果你已经在 Codex 里重新登录，桥接会自动重启本地 app-server 并重试一次；如果仍失败，请在 Codex 桌面端或 CLI 重新登录后再发一次。`;
     }
 
     if (/model .*does not exist or you do not have access/i.test(errorMessage)) {
